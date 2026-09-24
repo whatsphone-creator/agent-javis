@@ -8,11 +8,13 @@ A Claude skill that turns your current session into an orchestrator: it hands yo
 
 - Queues the tasks in your order and dispatches them to low-effort worker agents.
 - Runs a single lane by default. It only goes parallel (up to 3 lanes, each in its own git worktree) when the repo is local, the tasks clearly don't touch each other, and you're in Claude Code.
-- The orchestrator actually reviews the work: it reruns the worker's verification commands and reads the diff, instead of taking the report on trust.
+- The orchestrator actually reviews the work: it diffs against a base commit recorded before dispatch, checks that the verification proves written acceptance criteria, and reruns only safe, repeatable checks. Anything it couldn't check is reported as unverified.
+- A task only counts as done after review and, for parallel lanes, a clean merge plus an integration check.
 - Bounded rework: at most 2 retries per task, then it stops and asks you.
-- **Always stops for your approval** before deploying, pushing to production, changing a database or deleting anything.
+- **High-risk actions need your approval.** Workers may prepare migrations or deploy scripts, but running a deploy, pushing to production, executing database changes or deleting existing data waits for an explicit yes naming the action, target and scope.
+- Lanes can be paused or stopped individually; the others keep going.
 - Short reports: one line per finished task, with a full status table only when something is blocked, the queue is empty, or you ask.
-- Pings you (`PushNotification`) when a worker gets stuck, and a 25-minute fallback heartbeat catches workers that die silently.
+- Pings you (`PushNotification`) when a worker gets stuck. An optional 30-minute heartbeat, which only fires while the session is idle, picks up missed completion notifications.
 
 **Council mode**: give it a question.
 
@@ -49,7 +51,9 @@ Restart Claude Code (or start a new session) so it picks up the skill and the ag
 1. Zip the `skills/agent-javis` folder so the zip contains `agent-javis/SKILL.md`.
 2. Upload it under **Settings → Capabilities → Skills**.
 
-Cowork can't use the `javis-worker` agent type or worktrees, so the skill falls back to `general-purpose` agents and a single lane automatically.
+The skill decides its behaviour from the tools that actually load in the session. Where the `javis-worker` agent type, worktrees, `SendMessage`, scheduling or push notifications are missing, it falls back to `general-purpose` agents, a single lane, fresh agents with handovers, and in-conversation alerts. Without the `Agent` tool at all, the orchestrator does the tasks itself.
+
+**Status:** council mode has been run on Claude Code desktop (Windows). Execution mode has not yet been run end to end against [TESTING.md](TESTING.md), and Cowork / claude.ai are unverified. Reports welcome.
 
 ## Usage
 
@@ -72,7 +76,7 @@ You can interrupt at any time: add a task, change a task's direction, or stop a 
 
 - **`effort: low`** in `javis-worker.md` needs a Claude Code version that supports `effort` in agent frontmatter. Otherwise the worker runs at the default effort.
 - **Council members are all the same model** playing different roles, so the range of views is limited. For a genuinely different model's view, pair it with a cross-vendor council tool.
-- **Cowork**: heartbeat and push notifications aren't wired up; blockers are posted in the conversation.
+- **The heartbeat is not a watchdog.** Scheduled jobs only fire while the session is idle, so it can't rescue a hung session.
 - **Network drives** (NAS, SMB, cloud-sync folders) never get parallel lanes or worktrees, because git on them tends to hang or fight over `index.lock`.
 
 ## Files
@@ -80,6 +84,7 @@ You can interrupt at any time: add a task, change a task's direction, or stop a 
 ```
 skills/agent-javis/SKILL.md   the orchestration rules
 agents/javis-worker.md        the low-effort executor agent and its report format
+TESTING.md                    manual scenario checklist to run after changing the skill
 ```
 
 
