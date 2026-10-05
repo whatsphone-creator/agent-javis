@@ -1,156 +1,111 @@
 ---
 name: agent-javis
-description: "Use when the user hands over a task list (or keeps adding tasks) and wants the current session to orchestrate sub agents, or explicitly asks for a council / multi-perspective debate on a question (council mode: 2 rounds, then the orchestrator synthesises and can turn the conclusion into tasks). Remembers the sub agent model, spawns low-effort worker agents (single lane by default, parallel only when clearly safe), workers self-check, the orchestrator reviews against a recorded base commit, stops for approval before deploy/prod/DB/deletes, short progress reports."
+description: "Orchestrate a user task list with sub-agents, or run an explicitly requested two-round council. Works with the capabilities available in Claude or Codex. Ask the user to choose sub-agent models before dispatch; review actual changes and verification before marking work done."
 ---
 
-# agent-javis — the current session orchestrates, sub agents do the work
+# agent-javis
 
-## Step 0: before starting
+The current session orchestrates; sub-agents execute and self-check. These rules are portable across Claude and Codex. Use the tools and permissions actually available in the current session, not assumed product defaults.
 
-1. **Mode**: a task list means execution mode. Council mode only when the user explicitly asks for a council, a debate or multiple perspectives. An ordinary "review this" or "evaluate that" is just done directly, not as a council. Ask only if you genuinely can't tell.
-2. **Model**: read `~/.claude/skills/agent-javis/last-model.txt` (one of `opus` / `sonnet` / `haiku` / `fable`). Use it if present; otherwise use `opus`. **Don't ask.** State it in your first line, e.g. "Execution mode, sub agents on Opus — say so if you want a different model." If the user switches, write the new model back to the file; it takes effect at the next task boundary (see "Roles").
-3. **Load deferred tools in one go**: a single `ToolSearch` with `select:SendMessage,TaskStop,CronCreate,CronDelete,PushNotification`. Anything that fails to load is unavailable; follow the fallback table.
-4. **Task tracking**: use `TaskCreate` / `TaskUpdate` / `TaskList` if available; otherwise keep a checklist in `javis-queue.md` in the scratchpad. Each lane records: status (`active` / `paused` / `cancelled`), current task, worker ID, retry count, working directory, base commit.
+An ordinary request to review or compare this skill is not a request to launch workers or a council.
 
-## Environment and fallbacks
+## Before dispatch
 
-Decide from the tools that actually loaded in this session, not from which product you think you're in.
+1. **Mode:** a delegated task list means execution mode. Council mode requires an explicit request for a council, debate or multiple perspectives. An ordinary review is done directly. Ask only when the intended mode is unclear.
+2. **User chooses the model:** before the first sub-agent is launched, ask which available model the user wants. List only options verified by the current tool schema or runtime; include inheriting the session/default when supported. Do not hardcode a model, vendor or reasoning effort. If the user already specified the choice in this conversation, use it without asking again. Wait for the answer before dispatching; queue preparation and read-only inspection may continue.
+   - Apply the choice to execution workers and council members unless the user specifies different models per role.
+   - Do not read or write a saved model preference. A new conversation asks again unless its user has already chosen. A user-requested switch takes effect at the next task boundary.
+   - If a chosen model is unavailable, or the host cannot select it, explain the limitation and ask the user to choose an available model or accept the host default. Never silently substitute or claim to run a model the tool cannot select.
+   - If no sub-agent capability exists, explain that and proceed sequentially yourself for execution. Do not ask a meaningless model question or present a simulated council as independent agents.
+3. **Capabilities:** identify available spawning, continuation, interruption, waiting, questions, task tracking and scheduling tools. Load deferred tools only through the host's supported discovery mechanism when needed.
+4. **Queue:** use native task tracking if available; otherwise keep a checklist in the conversation or a writable scratch file. Record each lane's state, current task, worker ID, retry count, working directory and review baseline.
 
-| Missing tool | Fallback |
-|---|---|
-| `Agent` | No sub agents: the orchestrator does the tasks itself in this session, one at a time, and says so up front. Council mode is not available. |
-| `SendMessage` | Spawn a fresh agent each time, handing over the previous report and what's done. Council round 2 works the same way. |
-| `TaskStop` | Can't stop a running worker: stop dispatching to it, and review whatever it leaves behind before anything else touches those files. |
-| `CronCreate` or `CronDelete` | No heartbeat. Rely on completion notifications. |
-| `PushNotification` | Post blockers in the conversation only; say up front they may not reach the user's phone. |
-| `AskUserQuestion` | Ask in plain text. |
-| `javis-worker` agent type or `isolation: "worktree"` | Use `general-purpose` with the fallback prompt below; single lane only. |
+## Host tool mapping and fallbacks
 
-In Claude Cowork, talk to the user with `SendUserMessage` if that's how the session reports, and use `device_bash` for `git` if it's available.
+These are examples, not required names. Read the current schemas before calling a tool. Never call an unavailable tool or copy arguments between incompatible tools.
 
-## Roles
+| Capability | Claude examples | Codex examples | If unavailable |
+|---|---|---|---|
+| Spawn a sub-agent | `Agent` | `collaboration.spawn_agent` | Execute sequentially yourself; no independent council. |
+| Continue a worker | `SendMessage` | `collaboration.followup_task` for new work; `collaboration.send_message` for an active worker | Spawn a replacement with its prior report and verified state. |
+| Stop / inspect / wait | `TaskStop`, completion events | `collaboration.interrupt_agent`, `list_agents`, `wait_agent` | Stop dispatching; do not claim the worker stopped. Check its changes before another writer uses those files. |
+| Ask the user | `AskUserQuestion` | An available user-input tool | Ask in chat. Required model choices and approvals need an actual answer. |
+| Isolated checkout | `Agent` worktree isolation | Available worktree tools or supported Git worktrees | Use one writing lane. |
+| Heartbeat | Available create/delete scheduling tools | Available thread automation tools | Rely on completion events and bounded waits. |
+| Notifications | Available push tool | Host-supported notifications | Report in the conversation; do not promise a phone alert. |
 
-- **Orchestrator (the current session, whatever its model)**: queues, dispatches, reviews, runs the heartbeat. As a rule it does not edit files itself, with three exceptions:
-  - **Small tasks**: one file, a few lines, nothing touching money / permissions / databases / deployment. The orchestrator may do it directly, still verifies it, and the report says "done by orchestrator".
-  - **Approved high-risk actions** (see below): the orchestrator runs them itself.
-  - The retry limit is hit and the user chooses to let the orchestrator take over.
-- **Worker**: `Agent` with `subagent_type: "javis-worker"` and the model from step 0. Its working rules and report format live in `~/.claude/agents/javis-worker.md`, so dispatch prompts don't repeat them. If `javis-worker` is unavailable, use `general-purpose` and open the prompt with: "Default to low effort, but understand the relevant code path before changing it. Verify after your final change; if you can't run a check, report it as unverified. Prepare but never execute deploys, pushes to production, database changes or deletions of existing data — stop and report instead." Then add the report format.
-- **One worker per lane**: rework and the lane's next task go to the same worker via `SendMessage`. Spawn a replacement, at a task boundary, only when: the old worker died, its replies are clearly degraded after rework, or the user switched model. Before replacing, `TaskStop` the old one and check what it left behind (`git status --short`). Hand over the previous report and what's done in the new prompt.
+Use actual sub-agents for delegation, not user-owned chats/threads. Creating or messaging a separate user chat requires the user's authorization under the host's rules.
 
-## High-risk actions
+Pass model choices only through supported parameters. For example, a host may restrict model overrides with full-history forks; use a supported context mode and provide the necessary task context. Explain any conflict between the user's choice and a fixed-model agent profile before dispatch.
 
-**Preparing is fine; executing needs approval.**
+The skill is self-contained: no external worker profile or product-specific home directory is required. Use a compatible general worker capability by default. A specialized profile such as `javis-worker` is optional and must not override the user's model choice or these instructions.
 
-- Workers may: write migration files, deployment scripts or SQL files; delete temporary files they created in this task.
-- Stop and get approval before: running a deploy; `git push` to production or the main remote; executing database changes against a real database (running migrations, direct SQL); deleting data or files that existed before this task.
+## Execution roles
 
-The request names the exact action, the target environment and the scope (e.g. "run migration 0042 on production DB `shop`"). Approval covers only that. After a clear yes, the orchestrator runs it itself. That lane waits; other lanes carry on.
+The orchestrator queues, dispatches, reviews and reports. It may handle a small, low-impact edit directly, carry out already-authorized high-risk actions, or take over after the user chooses that remedy for repeated worker failure. Mark direct work in the report.
 
-## Task queue and lanes
+Use one worker per lane, continuing it for rework and subsequent tasks when possible. Replace it at a task boundary if it dies, its replies degrade despite correction, or a requested model switch requires replacement. Stop it where possible, inspect what it left behind and pass verified progress to the replacement. Never introduce a competing writer while the old worker may still be editing the same files.
 
-1. Add the user's tasks to the task list in the order given.
-2. **Default to a single lane, run in order.** Only run lanes in parallel (max 3) when all of these hold:
-   - the repo is on a local disk (**not a network drive, NAS, SMB share or cloud-synced folder**) and is a git repo;
-   - the main checkout is on the default branch with no uncommitted changes (isolated worktrees may start from the default branch, not your current `HEAD`);
-   - the tasks clearly don't interact: different files, no dependency on each other's results, no shared hot files (changelog, config, a shared partial);
-   - `Agent` with `isolation: "worktree"` is available.
+### Worker dispatch contract
 
-   If unsure, assume they collide and keep them in one lane.
-3. After assigning lanes, post one line, e.g. "A: T1, T3; B: T2". Don't wait for approval; the user can object straight away.
-4. **Parallel lanes use worktrees** (`isolation: "worktree"`). The worker commits on its branch and reports the worktree path, branch, base commit and commit hash. Before a lane's next task, tell its worker to merge the current default branch into its branch so it sees what other lanes have merged.
-5. Shared hot spots (e.g. the end of a changelog) are updated by one worker after every lane has merged.
-6. Within a lane, don't dispatch the next task until the current one is **done** (see the flow below).
+Give each worker:
 
-## When the user interrupts
+- Project context and applicable project instructions.
+- The user's task, preserving its intent and constraints.
+- Explicit ownership of files or modules. Tell it other agents may be working in the repository, not to revert their work, and to accommodate their changes.
+- Observable acceptance criteria and appropriate verification commands.
+- A baseline commit plus existing changes, or a before-edit snapshot when Git is unavailable.
+- These working rules: understand the relevant code before changing it; keep edits scoped; verify the final change; distinguish unverified results from passes. Prepare deployment scripts or migrations when requested, but hand execution of deployments, production pushes, real database changes and deletion of pre-existing data back to the orchestrator.
 
-- **New task**: goes to the end of the queue; if the user says it's urgent, it goes next in the relevant lane.
-- **Change of direction**: correct the same worker via `SendMessage`; if the change is large, replace the worker as described in "Roles".
-- **Stop one lane**: `TaskStop` its worker and mark the lane `cancelled`. Other lanes carry on, and so does the heartbeat.
-- **Pause**: mark the lane(s) `paused`. In-flight work may finish and be reviewed, but nothing new is dispatched and the heartbeat leaves paused lanes alone.
-- **Stop everything**: `TaskStop` all workers, mark all lanes `cancelled`, `CronDelete` the heartbeat.
-- Confirm in one line with the updated queue order.
+Worker report: result; changed files; checks and outcomes; unverified items or blockers; and, for isolated work, checkout path, branch, base commit and delivery commit. Do not require an external profile to define this format.
 
-## Per-task flow
+### Authorization
 
-```
-record base → dispatch → worker does it + checks → report → orchestrator review
-   ├─ not OK → SendMessage the same worker with exactly what's wrong → review again
-   └─ OK     → (parallel: merge + integration check) → mark done → one-line report → next task
-```
+Preparing a high-risk action is allowed within the requested task. Before the orchestrator executes a deployment, production/main-remote push, real database change or deletion of pre-existing files/data, check that the user has authorized the action, target and scope. Reuse clear authorization already given in the conversation; do not ask again merely because this skill is active. If authorization is missing, finish the preparation, describe the concrete action and ask. Other independent lanes may continue.
 
-A task is only **done** after it has passed review and, for parallel lanes, merged cleanly and passed the integration check. A merge conflict or failed integration check means not done: `git merge --abort` if needed and ask the user.
+## Queue and lanes
 
-### Before dispatching
-- Record the base: `git rev-parse HEAD` and `git status --short` in the directory the worker will use. Changes already present are the user's, not the worker's, and are excluded from review.
+- Preserve the user's task order. New tasks go at the end unless marked urgent; urgent tasks go next in the relevant lane.
+- Default to one lane. Parallel writing lanes require a local Git repository, clean integration checkout, independent tasks without shared hot files, and isolated checkouts with a known base. Do not use parallel writing lanes on NAS, SMB, network drives or cloud-synced folders.
+- At most three writing lanes, further limited by available agent slots. If uncertain about overlap, use one lane. Tell the user the lane allocation without a separate approval round.
+- Use the intended project branch/ref as the base; do not silently replace the user's current work with the default branch. Record each actual base and working directory. Explicitly direct workers to their own checkouts; spawning alone may not isolate files.
+- After a lane is reviewed and integrated, bring that verified integration state into the lane before its next dependent task. One worker updates shared hot files after the other lanes integrate.
+- A task is done only after review and, for isolated lanes, integration and relevant checks. Do not dispatch the next task in a lane before this point.
 
-### A dispatch prompt contains
-- One line of project context (which repo / feature) and which memory notes to read.
-- The task in the user's own words — don't paraphrase it into something else.
-- **Acceptance criteria**: observable outcomes that show the task is done (e.g. "the invoice page shows dates as DD/MM/YYYY", "tax for 100.00 at 8% is 8.00"). Not just "tests pass".
-- How to verify: which commands to run, and which of them are safe to repeat.
+## Review and rework
 
-### Orchestrator review
-- **Look at the real changes against the base**: committed work with `git diff --stat <base> <commit>` and then the key hunks; plus `git status --short` for uncommitted and untracked leftovers. Read line by line only where money, permissions or deletions are involved.
-- **Check the verification actually proves the acceptance criteria.** A passing lint or a test that doesn't exercise the requirement is not proof.
-- **Rerun only safe, repeatable checks** yourself (tests, linters, greps, local renders). Never rerun anything that writes to a real database or calls an external service.
-- If something couldn't be verified (no runtime, no test database, no browser), the report says **unverified** — never treat it as passed.
-- Check against the project's own rules (from `CLAUDE.md` / `AGENTS.md` / memory: naming, formatting, line endings, UI copy conventions). Any breach means not OK.
-- Feedback must be specific: which file and line, what was expected, what is there now.
+1. Before dispatch, record `git rev-parse HEAD` and `git status --short` where available. Capture relevant pre-existing changes so they can be distinguished from new work. Without Git, retain a before-edit snapshot of the files in scope; do not initialize a repository merely for this workflow.
+2. Review the actual delivery: committed diff against its base, uncommitted changes and untracked files. Inspect money, permissions and deletions closely. Check applicable `AGENTS.md`, `CLAUDE.md` and project conventions.
+3. Decide whether the verification demonstrates the acceptance criteria. A passing lint check alone does not establish functional correctness. Rerun only appropriate, safe, repeatable checks; do not repeat database writes or external actions as a verification shortcut.
+4. Report unavailable checks as unverified. Give specific rework feedback with file/line, expected behavior and actual behavior.
+5. Integrate reviewed isolated work one lane at a time and check the combined result. A conflict or failed check leaves the task unfinished. Resolve routine conflicts within the authorized scope; ask when resolution needs a user decision. Abort only this workflow's merge when needed to preserve a recoverable state.
+6. Allow at most two rework rounds after the initial delivery. If still unsuccessful, stop that lane and explain the blocker and options: change approach, orchestrator takeover or skip. Other independent lanes continue.
 
-### Parallel lanes: merge and integration check
-- In the main checkout, merge the reviewed commit (`git merge <branch>`), one lane at a time.
-- Rerun the safe checks on the merged result. Only then mark the task done.
+## Interruptions and progress
 
-### Retry limit
-After the first delivery, at most 2 rounds of rework. If it's still not OK after the second, stop that lane and tell the user where it's stuck, what you think, and what you suggest (change approach, orchestrator takes over, or skip). Other lanes carry on.
+- Changes of direction go to the active worker; replace it only when necessary and after checking its state.
+- On pause, mark the relevant lanes paused and dispatch no new work there. On stop, interrupt the relevant workers where supported and mark lanes cancelled. Be honest if interruption cannot be confirmed.
+- Report blockers promptly with the affected task and a concrete way forward. Use supported notifications only within the host's authorization rules.
+- Normally report one short line per finished task and what is next. Show the full queue when blocked, finished or asked for status. Include material impact, risks and unverified checks; do not repeat workers' full reports.
+- Use the user's language.
 
-## Blockers and heartbeat
+## Optional heartbeat
 
-- **As soon as a worker reports a blocker** (login, credentials, permissions, a high-risk action awaiting approval, ambiguity), tell the user, plus a `PushNotification` if available. Make it self-contained: which task, what's blocking, one or two options.
-- **Heartbeat** (only if both `CronCreate` and `CronDelete` loaded): scheduled jobs only fire while this session is idle, so this catches missed completion notifications. It is not a watchdog for a hung session. Keep **exactly one** recurring job, cron `*/30 * * * *`, prompt "agent-javis heartbeat", and record its ID.
-  - Create it when the first worker is dispatched, and again whenever work resumes and no job exists.
-  - On each run:
-    1. No `active` lane (everything done, cancelled, paused or waiting on the user) → `CronDelete` itself and do nothing else.
-    2. An `active` lane is idle, unfinished and not waiting on anyone → `SendMessage` the worker; if it's dead, replace it as in "Roles"; if a review was missed, do it now.
-    3. Can't fix it yourself → tell the user. If nothing is wrong, stay quiet.
+Use completion events and bounded waits by default. If background monitoring is requested or already authorized, and the host supports creating and cancelling a suitable job, keep at most one heartbeat for this queue, typically every 30 minutes. Record its identifier and follow the host's scheduling schema and lifecycle. Do not create persistent automation just because this skill was loaded.
 
-## Progress reports
-
-- **Normally**: one line per finished task, e.g. "✅ T3: changed X (lane A); next T4". Add "(done by orchestrator)" or "(partly unverified: …)" where it applies.
-- **Full table**: only when a task is blocked, the queue is empty, or the user asks for status. Two parts:
-  1. One line per task: ✅ done / 🔄 in progress (lane) / ⏳ queued / ⛔ blocked / ⏸ paused or waiting on user.
-  2. A three-to-five sentence project summary: where things stand, impact of the changes, newly found risks, what's next.
-- Write in the user's language, keep it short, and don't repeat the workers' long reports.
-- When the whole queue finishes and the user may be away, send a `PushNotification` if available.
+On a heartbeat: review missed completions; continue an idle, unfinished active lane when safe; replace a dead worker using the handover rules. Leave paused or user-blocked lanes alone. Stay quiet while nothing actionable changes; notify on completion, failure or required user action. Cancel the job when no active lanes remain; recreate it only when authorized monitoring resumes. A heartbeat does not guarantee recovery from a hung host, and idle-only execution is host-dependent.
 
 ## Council mode
 
-For discussing a question, not editing files. All members are read-only, and the orchestrator doesn't edit either. Needs `Agent`.
+Council members only read; the orchestrator does not edit files for the council. Requires real sub-agent capability.
 
-1. **Pick roles and let the user approve.** The orchestrator picks 2–4 roles for the topic, one line each: name and **the area it focuses on** (e.g. "reliability: what breaks under failure"). Give a focus, not a predetermined conclusion. No fixed cast; the roles should cover different concerns. The devil's advocate is not counted here. Ask both questions in one `AskUserQuestion`:
-   - **Roles** (multiSelect, one option per role): the user unticks unwanted roles or adds one via Other.
-   - **Add a devil's advocate?** Ask every time, with no "Recommended" label:
-     - Yes: argues against the mainstream view, hunts for holes and worst cases, and gives the strongest counter-argument even if it privately agrees.
-     - No
-
-   At most 5 members in total, including the devil's advocate.
-2. **Round 1: independent opinions.** Spawn all members in a single message (`Agent`, `subagent_type: "general-purpose"`, model from step 0) so they run in parallel. Don't use `javis-worker`; it's an executor, not suited to deliberation. Each prompt includes:
-   - The question verbatim plus context; point to any code or documents to read. If execution work is changing the same code, name a fixed commit to read from.
-   - The role and its focus.
-   - "You may only read. Do not modify any files."
-   - Reply format: position (one sentence); reasoning (up to 5 points, each marked as fact, assumption or opinion, with its source where there is one); biggest risk or objection; what would change your mind.
-3. **Round 2: key disagreements only.** The orchestrator lists the main disagreements from round 1. Each member gets the other members' round-1 opinions (labelled by role; condensing is fine, distorting is not) and responds to those disagreements: what they accept, what they dispute, and whether their position changed and why. Use `SendMessage`; without it, spawn a fresh agent with the member's own round-1 reply plus the others'. Include any facts the orchestrator has verified. If there is a devil's advocate, tell it to attack the conclusion most members agreed on in round 1.
-4. **Orchestrator synthesis.** Don't recap each member; write:
-   - **Consensus**
-   - **Disagreements**: which roles disagree on what, with each side's strongest argument (a table works).
-   - **Orchestrator's recommendation**: your own judgement and why — not just an average of the views.
-   - **Open questions**: what the user needs to supply or decide.
-
-   Open with a note that all members were played by the same model, so the diversity of views is limited.
-5. **Next step.** Ask whether to turn the conclusions into tasks. If yes, switch to execution mode starting from "Task queue and lanes", doing step 0.4 first. If a council is opened while execution is running, existing lanes keep going and the conclusions are queued at the end.
+1. Propose two to four roles with distinct areas of focus, not predetermined conclusions. Ask the user to approve or adjust them and whether to add a devil's advocate. Combine this with the required model question if still unanswered. At most five members including the devil's advocate.
+2. Round 1: give every member the original question, relevant context, a role and read-only instructions. Use a fixed source snapshot if execution is changing the same material. Request: one-sentence position; up to five reasons labelled fact, assumption or opinion with sources where available; largest objection; what would change its mind. Use the user's model choice(s). Run within the host's concurrency limit, batching when necessary without showing earlier members' replies to later round-1 members.
+3. Round 2: identify the important disagreements and send each member the other round-1 views, its own prior view if it is a replacement, and any verified facts. Ask what it accepts, disputes and changes its mind about. The devil's advocate challenges the strongest round-1 consensus. Continue existing members when supported; otherwise use read-only replacements with the full handover.
+4. Synthesize consensus, remaining disagreements and their strongest arguments, the orchestrator's own recommendation, and unresolved questions. Describe actual model diversity honestly: same-model role-play has limited diversity; do not claim different vendors or models unless verified.
+5. Ask whether to turn the conclusion into execution tasks. If yes, queue them and reuse the model choice already made in this conversation unless the user changes it. Existing execution lanes may continue; council outputs join their queue.
 6. No heartbeat for councils.
 
 ## Wrap-up
 
-- Queue empty or user stops: `TaskStop` any remaining workers, `CronDelete` the heartbeat, send the final report.
-- Record anything worth keeping across sessions (decisions, why something couldn't be done, new rules) in project memory.
+Stop any remaining workers belonging to this run when the queue finishes or the user stops it, cancel this queue's heartbeat if any, and report results and limitations. Preserve reusable project decisions in existing project memory when appropriate, but do not persist a model preference.
